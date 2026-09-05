@@ -1,0 +1,8 @@
+# apps/examples/button_led/Kconfig
+
+config EXAMPLES_BUTTON_LED
+	bool "openvela 桌宠按键与 LED"
+	default n
+	depends on EXAMPLES_CONTROL_CENTER
+	---help---
+	  K1 按键触发对话（替代唤醒词）+ LED 状态指示

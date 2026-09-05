@@ -1,0 +1,14 @@
+# apps/examples/control_center/Kconfig
+
+config EXAMPLES_CONTROL_CENTER
+	bool "openvela 桌宠控制中心"
+	default n
+	depends on LIB_CURL
+	select NETUTILS_CJSON
+	---help---
+	  openvela 桌宠控制中心：HTTP 激活 + IPC 音频/文本分发（no-ws 精简版）
+
+config EXAMPLES_CONTROL_CENTER_STACKSIZE
+	int "control_center 栈大小(字节)"
+	default 204800
+	depends on EXAMPLES_CONTROL_CENTER

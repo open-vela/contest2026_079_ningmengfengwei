@@ -1,0 +1,16 @@
+# apps/examples/lvgldemo/Kconfig
+
+config EXAMPLES_LVGLDEMO
+	bool "openvela 桌宠 GUI(lvgldemo)"
+	default n
+	depends on LVGL
+	select LV_USE_NUTTX
+	select LV_USE_NUTTX_TOUCHSCREEN
+	select NETUTILS_CJSON
+	---help---
+	  openvela 桌宠 GUI：LVGL 显示表情/文字/状态，IPC 收 control_center 文本
+
+config EXAMPLES_LVGLDEMO_STACKSIZE
+	int "lvgldemo 栈大小(字节)"
+	default 204800
+	depends on EXAMPLES_LVGLDEMO
