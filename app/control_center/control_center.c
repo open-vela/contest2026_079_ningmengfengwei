@@ -1,350 +1,568 @@
+// SPDX-License-Identifier: GPL-3.0-only
 /*
- * control_center - openvela 桌宠控制中心（无 WebSocket 精简版）
- *
- * 职责：
- *   1. libcurl HTTP 激活拿 token（带缓存）
- *   2. IPC 端点管理（arecord/button_led/lvgldemo/aplay）
- *   3. 按键门控：button_led 通知 g_recording → 控制 arecord 上行转发
- *   4. UI 消息处理：lvgldemo 配网请求（打桩）
- *
- * 注意：WebSocket 功能已剥离，后续补 libwebsockets + TLS 配置后再加回。
- * 对齐 xiaozhi-esp32 websocket_protocol.cc 的协议留待 WS 启用时对接。
+ * Copyright (c) 2008-2023 100askTeam : Dongshan WEI <weidongshan@100ask.net> 
+ * Discourse:  https://forums.100ask.net
  */
-
-#include "control_center.h"
-#include "ipc_udp.h"
-
+ 
+/*  Copyright (C) 2008-2023 深圳百问网科技有限公司
+ *  All rights reserved
+ *
+ * 免责声明: 百问网编写的文档, 仅供学员学习使用, 可以转发或引用(请保留作者信息),禁止用于商业用途！
+ * 免责声明: 百问网编写的程序, 用于商业用途请遵循GPL许可, 百问网不承担任何后果！
+ * 
+ * 本程序遵循GPL V3协议, 请遵循协议
+ * 百问网学习平台   : https://www.100ask.net
+ * 百问网交流社区   : https://forums.100ask.net
+ * 百问网官方B站    : https://space.bilibili.com/275908810
+ * 本程序所用开发板 : Linux开发板
+ * 百问网官方淘宝   : https://100ask.taobao.com
+ * 联系我们(E-mail) : weidongshan@100ask.net
+ *
+ *          版权所有，盗版必究。
+ *  
+ * 修改历史     版本号           作者        修改内容
+ *-----------------------------------------------------
+ * 2025.03.20      v01         百问科技      创建文件
+ *-----------------------------------------------------
+ */
 #include <stdio.h>
-#include <string.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
-#include <time.h>
-#include <arpa/inet.h>
-
-#include <curl/curl.h>
+#include <stdbool.h>
+#include <stdbool.h>
+#include <libwebsockets.h>
 #include <cJSON.h>
-#include <opus.h>   /* opus 解码；头在 .../apps/external/opus/opus/include/ 平面目录（无 opus/ 子层），故用 <opus.h> */
+#include "websocket_client.h"
+#include "http.h"
+#include "ipc_udp.h"
+#include "uuid.h"
+#include "cfg.h"
+#include "leds.h"
 
-#define CC_TAG "control_center"
+#include <syslog.h>
+#define printf(fmt, ...) syslog(LOG_INFO, fmt, ##__VA_ARGS__)
 
-/* ===== 全局状态 ===== */
-static volatile bool g_stop = false;
+static int g_ui_upload_enable = 1;
+static int g_audio_upload_enable = 1;
+static int g_audio_download_enable = 1;
+static int g_audio_disabled_while_speaking = 0;
+static char g_session_id[64] = "";
 
-static char g_token[256] = {0};      /* Authorization token */
-static char g_device_id[64] = {0};   /* MAC */
-static char g_client_id[96] = {0};   /* 客户端标识 */
+typedef enum ListeningMode {
+    kListeningModeAutoStop,
+    kListeningModeManualStop,
+    kListeningModeAlwaysOn // 需要 AEC 支持
+} ListeningMode;
 
-/* IPC 端点 */
-static p_ipc_endpoint_t g_ep_audio_up = NULL;    /* 收 arecord opus */
-static p_ipc_endpoint_t g_ep_audio_down = NULL; /* 发 aplay */
-static p_ipc_endpoint_t g_ep_ui = NULL;          /* 发 lvgldemo */
-static p_ipc_endpoint_t g_ep_button = NULL;      /* 收 button_led 按键消息(BUTTON_PORT_UP) */
-static p_ipc_endpoint_t g_ep_ui_up = NULL;       /* 收 lvgldemo 触摸/配网请求(UI_PORT_UP) */
+// 定义设备状态枚举类型
+typedef enum DeviceState {
+    kDeviceStateUnknown,
+    kDeviceStateStarting,
+    kDeviceStateWifiConfiguring,
+    kDeviceStateIdle,
+    kDeviceStateConnecting,
+    kDeviceStateListening,
+    kDeviceStateSpeaking,
+    kDeviceStateUpgrading,
+    kDeviceStateActivating,
+    kDeviceStateFatalError
+} DeviceState;
 
-/* 录音状态：由 button_led 通过 IPC 通知 */
-static volatile bool g_recording = false;
-
-/* ===== libcurl 写回调 ===== */
-struct memory {
-    char *response;
-    size_t size;
-};
-
-static size_t write_cb(void *data, size_t size, size_t nmemb, void *userp)
+static p_ipc_endpoint_t g_ipc_ep_audio;
+static p_ipc_endpoint_t g_ipc_ep_ui;
+static p_ipc_endpoint_t g_ipc_ep_button;
+static DeviceState g_device_state = kDeviceStateUnknown;
+static void set_device_state(DeviceState state)
 {
-    size_t realsize = size * nmemb;
-    struct memory *mem = (struct memory *)userp;
-    char *ptr = realloc(mem->response, mem->size + realsize + 1);
-    if (!ptr) {
-        return 0;
-    }
-    mem->response = ptr;
-    memcpy(&(mem->response[mem->size]), data, realsize);
-    mem->size += realsize;
-    mem->response[mem->size] = 0;
-    return realsize;
+    g_device_state = state;
 }
 
-/* ===== 设备标识 ===== */
-static int get_device_id(char *out, size_t n)
+static void send_device_state(void)
 {
-    FILE *f = fopen("/sys/class/net/wlan0/address", "r");
-    if (f) {
-        if (fgets(out, n, f)) {
-            out[strcspn(out, "\r\n")] = 0;
-        }
-        fclose(f);
-        if (strlen(out) > 0) {
-            return 0;
-        }
-    }
-    strncpy(out, "AA:BB:CC:DD:EE:FF", n - 1);
-    out[n - 1] = 0;
-    return -1;
+    char stateString[64];
+    snprintf(stateString, sizeof(stateString), "{\"state\":%d}", g_device_state);
+
+    if (g_ui_upload_enable)
+        g_ipc_ep_ui->send(g_ipc_ep_ui, stateString, strlen(stateString));
 }
 
-static void make_client_id(char *out, size_t n)
+static void send_stt(const char* text)
 {
-    char tmp[64];
-    strncpy(tmp, g_device_id, sizeof(tmp) - 1);
-    tmp[sizeof(tmp) - 1] = 0;
-    for (char *p = tmp; *p; p++) {
-        if (*p == ':') {
-            *p = '-';
-        }
-    }
-    snprintf(out, n, "openvela-%s", tmp);
-}
-
-/* ===== HTTP 激活 ===== */
-static int device_activate(void)
-{
-    /* 先用缓存 token */
-    FILE *f = fopen("/data/token", "r");
-    if (f) {
-        if (fgets(g_token, sizeof(g_token), f)) {
-            g_token[strcspn(g_token, "\r\n")] = 0;
-        }
-        fclose(f);
-        if (strlen(g_token) > 0) {
-            printf(CC_TAG ": use cached token\n");
-            return 0;
-        }
-    }
-
-    CURL *curl = curl_easy_init();
-    if (!curl) {
-        return -1;
-    }
-    struct memory chunk = {0};
-    struct curl_slist *hdrs = NULL;
-    hdrs = curl_slist_append(hdrs, "Content-Type: application/json");
-
-    char body[256];
-    snprintf(body, sizeof(body),
-             "{\"device_id\":\"%s\",\"client_id\":\"%s\",\"model\":\"openvela-desktop-pet\"}",
-             g_device_id, g_client_id);
-
-    curl_easy_setopt(curl, CURLOPT_URL, XIAOZHI_ACTIVATE_URL);
-    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdrs);
-    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body);
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_cb);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &chunk);
-    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
-    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
-
-    CURLcode res = curl_easy_perform(curl);
-    curl_slist_free_all(hdrs);
-    curl_easy_cleanup(curl);
-
-    if (res != CURLE_OK) {
-        printf(CC_TAG ": activate failed: %s\n", curl_easy_strerror(res));
-        free(chunk.response);
-        return -1;
-    }
-
-    /* 解析 token：chunk.response 可能为空（网络返回空/curl 未写数据），必须先判空，否则 cJSON_Parse(NULL) 会解引用崩溃 */
-    if (!chunk.response || chunk.size == 0) {
-        printf(CC_TAG ": activate: empty response, skip parse\n");
-        return -1;
-    }
-    cJSON *root = cJSON_Parse(chunk.response);
-    if (root) {
-        cJSON *t = cJSON_GetObjectItem(root, "token");
-        if (cJSON_IsString(t)) {
-            strncpy(g_token, t->valuestring, sizeof(g_token) - 1);
-            g_token[sizeof(g_token) - 1] = 0;
-        }
-        cJSON *io = cJSON_GetObjectItem(root, "websocket");
-        if (cJSON_IsString(io)) {
-            printf(CC_TAG ": server io=%s\n", io->valuestring);
-        }
-        cJSON_Delete(root);
-    }
-    free(chunk.response);
-
-    if (strlen(g_token) > 0) {
-        f = fopen("/data/token", "w");
-        if (f) {
-            fputs(g_token, f);
-            fclose(f);
-        }
-        return 0;
-    }
-    printf(CC_TAG ": activate no token in response\n");
-    return -1;
-}
-
-/* ===== IPC 回调：arecord 上报 opus → 仅在 recording 态转发 aplay（本地回环测试）=====
- * WebSocket 未启用时，把 arecord 的 opus 解码后转发 aplay，验证音频通路通。 */
-static OpusDecoder *g_dec = NULL;
-static unsigned char g_pcm_buf[16000 * 2];  /* 1s @ 16kHz 16bit */
-
-static void on_audio_from_arecord(const char *data, int len, void *user)
-{
-    (void)user;
-    if (!g_recording) {
-        return;
-    }
-    if (!g_dec || !g_ep_audio_down) {
+    if (!g_ipc_ep_ui) {
+        fprintf(stderr, "Error: g_ipc_ep_ui is nullptr\n");
         return;
     }
 
-    /* 跳过 BinaryProtocol3 头（4字节），payload 是 opus */
-    const unsigned char *opus = (const unsigned char *)data;
-    int opus_len = len;
-    if (len > 4) {
-        /* 可能带 bp3 头，尝试跳过 */
-        if (opus[0] == XZ_BIN_TYPE_OPUS) {
-            uint16_t plen = (opus[2] << 8) | opus[3];
-            if ((int)(4 + plen) <= len) {
-                opus += 4;
-                opus_len = plen;
+    cJSON *j = cJSON_CreateObject();
+    cJSON_AddStringToObject(j, "text", text);
+    char *textString = cJSON_PrintUnformatted(j);
+    g_ipc_ep_ui->send(g_ipc_ep_ui, textString, strlen(textString));
+    cJSON_Delete(j);
+    free(textString);
+}
+
+static void process_opus_data_downloaded(const char *buffer, size_t size)
+{
+#if 0    
+    printf("Received opus data: %zu bytes\n", size);
+    static int file_number = 1;
+    // 构造文件名
+    char filename[20];
+    snprintf(filename, sizeof(filename), "test%03d.opus", file_number);
+
+    // 打开文件
+    FILE *file = fopen(filename, "wb");
+    if (file) {
+        // 写入Opus数据
+        fwrite(buffer, 1, size, file);
+        fclose(file);
+        file_number++; // 增加文件编号
+    } else {
+        fprintf(stderr, "Failed to open file %s for writing\n", filename);
+    }     
+#endif    
+    if (g_audio_download_enable)
+    {
+        g_ipc_ep_audio->send(g_ipc_ep_audio, buffer, size);
+    }
+}
+
+static void send_start_listening_req(ListeningMode mode)
+{
+    char startString[256];
+    snprintf(startString, sizeof(startString), "{\"session_id\":\"%s\",\"type\":\"listen\",\"state\":\"start\"", g_session_id);
+
+    if (mode == kListeningModeAutoStop) {
+        strcat(startString, ",\"mode\":\"auto\"}");
+    } else if (mode == kListeningModeManualStop) {
+        strcat(startString, ",\"mode\":\"manual\"}");
+    } else if (mode == kListeningModeAlwaysOn) {
+        strcat(startString, ",\"mode\":\"realtime\"}");
+    }
+
+    websocket_send_text(startString, strlen(startString));
+    printf("Send: %s\n", startString);
+}
+
+static void send_stop_listening_req(void)
+{
+    char stopString[256];
+    snprintf(stopString, sizeof(stopString), "{\"session_id\":\"%s\",\"type\":\"listen\",\"state\":\"stop\"", g_session_id);
+
+
+
+    websocket_send_text(stopString, strlen(stopString));
+    printf("Send: %s\n", stopString);
+}
+static void process_hello_json(const char *buffer, size_t size)
+{    
+    cJSON *j = cJSON_Parse(buffer);
+    if (!j) {
+        fprintf(stderr, "Failed to parse JSON\n");
+        return;
+    }
+
+    cJSON *audio_params = cJSON_GetObjectItem(j, "audio_params");
+    if (audio_params) {
+        int sample_rate = cJSON_GetObjectItem(audio_params, "sample_rate")->valueint;
+        int channels = cJSON_GetObjectItem(audio_params, "channels")->valueint;
+        printf("Received valid 'hello' message with sample_rate: %d and channels: %d\n", sample_rate, channels);
+    }
+
+    cJSON *session_id = cJSON_GetObjectItem(j, "session_id");
+    if (session_id && cJSON_IsString(session_id)) {
+        strncpy(g_session_id, session_id->valuestring, sizeof(g_session_id)-1);
+    }
+
+    const char *desc = "{\"session_id\":\"\",\"type\":\"iot\",\"update\":true,\"descriptors\":[{\"name\":\"LED1\",\"description\":\"厨房灯\",\"properties\":{\"status\":{\"description\":\"打开或者关闭\",\"type\":\"number\"}},\"methods\":{\"SetStatus\":{\"description\":\"设置状态\",\"parameters\":{\"status\":{\"description\":\"0或1\",\"type\":\"boolean\"}}}}}]}";
+    websocket_send_text(desc, strlen(desc));
+    printf("Send: %s\n", desc);
+
+    desc = "{\"session_id\":\"\",\"type\":\"iot\",\"update\":true,\"descriptors\":[{\"name\":\"LED2\",\"description\":\"客厅灯\",\"properties\":{\"status\":{\"description\":\"打开或者关闭\",\"type\":\"number\"}},\"methods\":{\"SetStatus\":{\"description\":\"设置状态\",\"parameters\":{\"status\":{\"description\":\"0或1\",\"type\":\"boolean\"}}}}}]}";
+    websocket_send_text(desc, strlen(desc));
+    printf("Send: %s\n", desc);
+
+    const char *startString = "{\"session_id\":\"\",\"type\":\"listen\",\"state\":\"start\",\"mode\":\"auto\"}";
+    websocket_send_text(startString, strlen(startString));
+    printf("Send: %s\n", startString);
+
+    g_audio_disabled_while_speaking = 0;
+
+    // const char *state = "{\"session_id\":\"\",\"type\":\"iot\",\"update\":true,\"states\":[{\"name\":\"Speaker\",\"state\":{\"volume\":80}},{\"name\":\"Backlight\",\"state\":{\"brightness\":75}},{\"name\":\"Battery\",\"state\":{\"level\":0,\"charging\":false}}]}";
+    // websocket_send_text(state, strlen(state));
+    // printf("Send: %s\n", state);
+
+    cJSON_Delete(j);
+}
+
+static void process_other_json(const char *buffer, size_t size)
+{
+    cJSON *j = cJSON_Parse(buffer);
+    if (!j) {
+        fprintf(stderr, "Failed to parse JSON\n");
+        return;
+    }
+
+    cJSON *type = cJSON_GetObjectItem(j, "type");
+    if (!type || !cJSON_IsString(type)) {
+        cJSON_Delete(j);
+        return;
+    }
+
+    if (strcmp(type->valuestring, "tts") == 0) {
+        cJSON *state = cJSON_GetObjectItem(j, "state");
+        if (state && cJSON_IsString(state)) {
+            if (strcmp(state->valuestring, "start") == 0) {
+                // 下发语音, 可以关闭录音
+                g_audio_disabled_while_speaking = 1;
+                set_device_state(kDeviceStateListening);
+                send_device_state();
+            } else if (strcmp(state->valuestring, "stop") == 0) {
+                // 本次交互结束, 可以继续上传声音
+                // 等待一会以免她听到自己的话误以为再次对话
+                sleep(1);
+                send_start_listening_req(kListeningModeAutoStop);
+                set_device_state(kDeviceStateListening);
+                send_device_state();
+
+                g_audio_disabled_while_speaking = 0;
+            } else if (strcmp(state->valuestring, "sentence_start") == 0) {
+                // 取出"text", 通知GUI
+                cJSON *text = cJSON_GetObjectItem(j, "text");
+                if (text && cJSON_IsString(text)) {
+                    send_stt(text->valuestring);
+                }
+                send_start_listening_req(kListeningModeAutoStop);
+                set_device_state(kDeviceStateSpeaking);
+                send_device_state();
             }
         }
-    }
-
-    int frame_size = opus_decoder_get_size(g_dec);
-    int samples = opus_decode(g_dec, opus, opus_len, (opus_int16 *)g_pcm_buf,
-                              sizeof(g_pcm_buf) / 2, 0);
-    if (samples > 0) {
-        g_ep_audio_down->send(g_ep_audio_down, (const char *)g_pcm_buf, samples * 2);
-    }
-}
-
-/* ===== IPC 回调：button_led 按键消息 ===== */
-static void on_button_msg(const char *data, int len, void *user)
-{
-    (void)user;
-    if (!data || len <= 0) {
-        return;
-    }
-    char buf[128];
-    int n = len;
-    if (n >= (int)sizeof(buf)) {
-        n = (int)sizeof(buf) - 1;
-    }
-    memcpy(buf, data, n);
-    buf[n] = 0;
-
-    cJSON *root = cJSON_Parse(buf);
-    if (!root) {
-        printf(CC_TAG ": button msg parse fail: %s\n", buf);
-        return;
-    }
-    cJSON *type = cJSON_GetObjectItem(root, "type");
-    if (cJSON_IsString(type)) {
-        if (strcmp(type->valuestring, "record_start") == 0) {
-            g_recording = true;
-            printf(CC_TAG ": recording ON (K1 pressed)\n");
-        } else if (strcmp(type->valuestring, "record_stop") == 0) {
-            g_recording = false;
-            printf(CC_TAG ": recording OFF (K1 released)\n");
+    } else if (strcmp(type->valuestring, "stt") == 0) {
+        // 表示服务器端识别到了用户语音, 取出"text", 通知GUI
+        cJSON *text = cJSON_GetObjectItem(j, "text");
+        if (text && cJSON_IsString(text)) {
+            send_stt(text->valuestring);
         }
-    }
-    cJSON_Delete(root);
-}
-
-/* ===== IPC 回调：lvgldemo 触摸/配网请求 ===== */
-static void on_ui_msg(const char *data, int len, void *user)
-{
-    (void)user;
-    if (!data || len <= 0) {
-        return;
-    }
-    char buf[512];
-    int n = len;
-    if (n >= (int)sizeof(buf)) {
-        n = (int)sizeof(buf) - 1;
-    }
-    memcpy(buf, data, n);
-    buf[n] = 0;
-
-    cJSON *root = cJSON_Parse(buf);
-    if (!root) {
-        printf(CC_TAG ": ui msg parse fail: %s\n", buf);
-        return;
-    }
-    cJSON *type = cJSON_GetObjectItem(root, "type");
-    if (cJSON_IsString(type)) {
-        const char *t = type->valuestring;
-        if (strcmp(t, "wifi_scan") == 0) {
-            printf(CC_TAG ": [stub] wifi_scan requested\n");
-            const char *reply = "{\"type\":\"wifi_list\",\"aps\":[]}";
-            if (g_ep_ui) {
-                g_ep_ui->send(g_ep_ui, reply, (int)strlen(reply));
+    } else if (strcmp(type->valuestring, "llm") == 0) {
+        // 有"happy"等取值
+        cJSON *emotion = cJSON_GetObjectItem(j, "emotion");
+        // 处理情绪...
+    } else if (strcmp(type->valuestring, "iot") == 0) {
+        // 处理 IoT 消息...
+        // {"type":"iot","commands":[{"name":"LED1","method":"SetStatus","parameters":{"status":1}}],"session_id":"7116146e"}
+        // 获取commands数组
+        cJSON *commands = cJSON_GetObjectItem(j, "commands");
+        if (commands && cJSON_IsArray(commands)) {
+            // 遍历commands数组
+            int commands_count = cJSON_GetArraySize(commands);
+            for (int i = 0; i < commands_count; i++) {
+                cJSON *command = cJSON_GetArrayItem(commands, i);
+                
+                cJSON *method = cJSON_GetObjectItem(command, "method");
+                cJSON *name = cJSON_GetObjectItem(command, "name");
+                cJSON *parameters = cJSON_GetObjectItem(command, "parameters"); 
+                
+                if (name && cJSON_IsString(name) && strncmp(name->valuestring, "LED", 3) == 0) {
+                    int which = name->valuestring[3] - '1';
+                    if (method && cJSON_IsString(method)) {
+                        if (strcmp(method->valuestring, "SetStatus") == 0 && parameters) {
+                            cJSON *status = cJSON_GetObjectItem(parameters, "status");
+                            if (status) {
+                                int led_status = status->valueint;
+                                printf("LED%d SetStatus request received, status: %d\n", which+1, led_status);
+                                leds_ctl(which, led_status);
+                            }
+                        }
+                    }
+                }
             }
-        } else if (strcmp(t, "wifi_connect") == 0) {
-            cJSON *ssid = cJSON_GetObjectItem(root, "ssid");
-            cJSON *pwd = cJSON_GetObjectItem(root, "pwd");
-            const char *s = cJSON_IsString(ssid) ? ssid->valuestring : "?";
-            const char *p = cJSON_IsString(pwd) ? pwd->valuestring : "";
-            printf(CC_TAG ": [stub] wifi_connect ssid=%s pwd_len=%d\n", s, (int)strlen(p));
-            const char *reply = "{\"type\":\"wifi_status\",\"state\":\"disconnected\"}";
-            if (g_ep_ui) {
-                g_ep_ui->send(g_ep_ui, reply, (int)strlen(reply));
-            }
-        } else {
-            printf(CC_TAG ": ui msg type=%s\n", t);
         }
+       
     }
-    cJSON_Delete(root);
+
+    cJSON_Delete(j);
 }
 
-/* ===== main ===== */
+static void process_txt_data_downloaded(const char *buffer, size_t size)
+{
+    cJSON *j = cJSON_Parse(buffer);
+    if (!j) {
+        fprintf(stderr, "Failed to parse JSON message\n");
+        return;
+    }
+
+    cJSON *type = cJSON_GetObjectItem(j, "type");
+    if (type && cJSON_IsString(type) && strcmp(type->valuestring, "hello") == 0) {
+        process_hello_json(buffer, size);
+    } else {
+        process_other_json(buffer, size);
+    }
+
+    cJSON_Delete(j);
+}
+
+int process_opus_data_uploaded(char *buffer, size_t size, void *user_data)
+{
+#if 0    
+    static int file_number = 1;
+    // 构造文件名
+    char filename[20];
+    snprintf(filename, sizeof(filename), "test%03d.opus", file_number);
+
+    // 打开文件
+    FILE *file = fopen(filename, "wb");
+    if (file) {
+        // 写入Opus数据
+        fwrite(buffer, 1, size, file);
+        fclose(file);
+        file_number++; // 增加文件编号
+    } else {
+        fprintf(stderr, "Failed to open file %s for writing\n", filename);
+    }   
+#endif
+    if (g_audio_upload_enable && !g_audio_disabled_while_speaking) {
+        static int cnt = 0;
+        if ((cnt++ % 100) == 0)
+            printf("Send opus data to server: %zu count: %d\n", size, cnt);
+        websocket_send_binary(buffer, size);
+    }
+    return 0;
+}
+
+int process_ui_data(char *buffer, size_t size, void *user_data)
+{
+    if (!strcmp(buffer, "standby"))
+    {
+        //send_stop_listening_req();
+        //set_device_state(kDeviceStateIdle);
+        g_audio_upload_enable = 0;
+        g_audio_download_enable = 0;
+        g_ui_upload_enable = 0;
+    }
+    else
+    {
+        //send_start_listening_req(kListeningModeAutoStop);
+        //set_device_state(kDeviceStateListening);
+        g_audio_upload_enable = 1;
+        g_audio_download_enable = 1;
+        g_ui_upload_enable = 1;
+        g_audio_disabled_while_speaking = 0;
+    }
+    return 0;
+}
+
+int on_button_msg(char *buffer, size_t size, void *user_data)
+{
+    printf("Received button message: %s\n", buffer);
+
+    cJSON *j = cJSON_Parse(buffer);
+    if (!j) {
+        fprintf(stderr, "Failed to parse button JSON\n");
+        return -1;
+    }
+
+    cJSON *type = cJSON_GetObjectItem(j, "type");
+    if (!type || !cJSON_IsString(type)) {
+        cJSON_Delete(j);
+        return -1;
+    }
+
+    if (strcmp(type->valuestring, "record_start") == 0) {
+        printf("recording ON (K1 pressed)\n");
+        g_audio_upload_enable = 1;
+        g_audio_disabled_while_speaking = 0;
+    } else if (strcmp(type->valuestring, "record_stop") == 0) {
+        printf("recording OFF (K1 released)\n");
+        g_audio_upload_enable = 0;
+    }
+
+    cJSON_Delete(j);
+    return 0;
+}
+
+/**
+ * 从配置文件中读取 UUID
+ *
+ * 该函数尝试从 /etc/xiaozhi.cfg 文件中读取 UUID。
+ * 如果文件存在且包含有效的 UUID，则返回该 UUID。
+ * 否则，返回空字符串。
+ *
+ * @return 从配置文件中读取的 UUID，如果未找到则返回空字符串
+ */
+char* read_uuid_from_config() {
+    FILE *config_file = fopen(CFG_FILE, "r");
+    if (!config_file) {
+        fprintf(stderr, "Failed to open " CFG_FILE " for reading\n");
+        return NULL;
+    }
+
+    fseek(config_file, 0, SEEK_END);
+    long length = ftell(config_file);
+    fseek(config_file, 0, SEEK_SET);
+    
+    char *data = malloc(length + 1);
+    fread(data, 1, length, config_file);
+    data[length] = '\0';
+    fclose(config_file);
+
+    cJSON *config_json = cJSON_Parse(data);
+    free(data);
+    
+    if (!config_json) {
+        fprintf(stderr, "Failed to parse " CFG_FILE "\n");
+        return NULL;
+    }
+
+    cJSON *uuid = cJSON_GetObjectItem(config_json, "uuid");
+    if (uuid && cJSON_IsString(uuid)) {
+        char *result = strdup(uuid->valuestring);
+        cJSON_Delete(config_json);
+        return result;
+    }
+
+    cJSON_Delete(config_json);
+    return NULL;
+}
+
+/**
+ * 将 UUID 写入配置文件
+ *
+ * 该函数将给定的 UUID 写入 /etc/xiaozhi.cfg 文件。
+ * 如果文件不存在，则创建新文件。
+ *
+ * @param uuid 要写入配置文件的 UUID
+ * @return 成功写入文件返回 true，否则返回 false
+ */
+bool write_uuid_to_config(const char* uuid) {
+    FILE *config_file = fopen(CFG_FILE, "w");
+    if (!config_file) {
+        fprintf(stderr, "Failed to open " CFG_FILE " for writing\n");
+        return false;
+    }
+
+    cJSON *config_json = cJSON_CreateObject();
+    cJSON_AddStringToObject(config_json, "uuid", uuid);
+    
+    char *json_str = cJSON_Print(config_json);
+    fwrite(json_str, 1, strlen(json_str), config_file);
+    
+    fclose(config_file);
+    cJSON_Delete(config_json);
+    free(json_str);
+    
+    return true;
+}
+
 int main(int argc, char **argv)
 {
-    printf(CC_TAG ": starting (no-ws mode)\n");
-    curl_global_init(CURL_GLOBAL_DEFAULT);
+    char active_code[20] = "";
 
-    /* opus 解码器（本地方便时用）*/
-    int err;
-    g_dec = opus_decoder_create(OPUS_SAMPLE_RATE, OPUS_CHANNELS, &err);
-    if (!g_dec) {
-        printf(CC_TAG ": opus decoder create failed: %d\n", err);
+    g_ui_upload_enable = 1;
+    g_audio_upload_enable = 1;
+    g_audio_download_enable = 1;
+    g_audio_disabled_while_speaking = 0;
+
+    leds_init();
+
+    // 获取无线网卡的 MAC 地址
+    char *mac;
+    
+    while (1)
+    {
+        printf("to get MAC ...\n");
+        mac = get_wireless_mac_address();
+        if (!mac || !strcmp(mac, "00:00:00:00:00:00"))
+            sleep(1);
+        else
+            break;
+    }
+    printf("MAC: %s\n", mac);
+
+    // 读取配置文件中的 UUID
+    char *uuid = read_uuid_from_config();
+    if (!uuid) {
+        fprintf(stderr, "UUID not found in " CFG_FILE "\n");
+        // 生成新的 UUID
+        uuid = generate_uuid();
+        printf("Generated new UUID: %s\n", uuid);
+
+        // 将新的 UUID 写入配置文件
+        if (!write_uuid_to_config(uuid)) {
+            fprintf(stderr, "Failed to write UUID to " CFG_FILE "\n");
+        } else {
+            printf("UUID written to " CFG_FILE "\n");
+        }
+    } else {
+        printf("UUID from " CFG_FILE ": %s\n", uuid);
+    }    
+
+    g_ipc_ep_audio = ipc_endpoint_create_udp(AUDIO_PORT_UP, AUDIO_PORT_DOWN, process_opus_data_uploaded, NULL);
+    g_ipc_ep_ui = ipc_endpoint_create_udp(UI_PORT_UP, UI_PORT_DOWN, process_ui_data, NULL);
+    g_ipc_ep_button = ipc_endpoint_create_udp(BUTTON_PORT_UP, 0, on_button_msg, NULL);
+    if (!g_ipc_ep_audio || !g_ipc_ep_ui || !g_ipc_ep_button)
+    {
+        printf("Failed to create IPC endpoints, %p,%p,%p\n", g_ipc_ep_audio, g_ipc_ep_ui, g_ipc_ep_button);
+        return -1;
     }
 
-    get_device_id(g_device_id, sizeof(g_device_id));
-    make_client_id(g_client_id, sizeof(g_client_id));
-    printf(CC_TAG ": device_id=%s client_id=%s\n", g_device_id, g_client_id);
+    http_data_t http_data;
+    http_data.url = "https://api.tenclass.net/xiaozhi/ota/";
 
-    /* IPC 端点 */
-    g_ep_audio_up = ipc_endpoint_create_udp(AUDIO_PORT_UP, 0, on_audio_from_arecord, NULL);
-    g_ep_audio_down = ipc_endpoint_create_udp(0, AUDIO_PORT_DOWN, NULL, NULL);
-    g_ep_ui = ipc_endpoint_create_udp(0, UI_PORT_DOWN, NULL, NULL);
-    g_ep_button = ipc_endpoint_create_udp(BUTTON_PORT_UP, 0, on_button_msg, NULL);
-    if (!g_ep_button) {
-        printf(CC_TAG ": WARN: button endpoint create failed\n");
+    // 构造 http_data.post
+    char post_buffer[512];
+    snprintf(post_buffer, sizeof(post_buffer), 
+        "{\"uuid\":\"%s\",\"application\":{\"name\":\"xiaozhi_linux_100ask\",\"version\":\"1.0.0\"},\"ota\":{},\"board\":{\"type\":\"100ask_openvela_board\",\"name\":\"100ask_t113s3_board\"}}", 
+        uuid);
+    http_data.post = post_buffer;
+
+    // 构造 http_data.headers
+    char headers_buffer[512];
+    snprintf(headers_buffer, sizeof(headers_buffer),
+        "{\"Content-Type\":\"application/json\",\"Device-Id\":\"%s\",\"User-Agent\":\"weidongshan1\",\"Accept-Language\":\"zh-CN\"}",
+        mac);
+    http_data.headers = headers_buffer;
+
+    while (0 != active_device(&http_data, active_code)) {
+        if (active_code[0]) {
+            char auth_code[64];
+            snprintf(auth_code, sizeof(auth_code), "Active-Code: %s", active_code);
+            set_device_state(kDeviceStateActivating);
+            send_device_state();
+            send_stt(auth_code);
+        }
+        sleep(5);
     }
-    g_ep_ui_up = ipc_endpoint_create_udp(UI_PORT_UP, 0, on_ui_msg, NULL);
-    if (!g_ep_ui_up) {
-        printf(CC_TAG ": WARN: ui_up endpoint create failed\n");
-    }
 
-    /* HTTP 激活：本板无真实外网，curl 在 RTOS 上无网解析时可能触发 Data abort 崩溃。
-     * 阶段目标为打通本地 IPC 链路，故遇无外网环境直接跳过 activate，不执行 curl 网络请求。
-     * device_activate() 函数保留，待接入 Wi-Fi/外网或提供 /data/token 缓存后再启用。
-     */
-    printf(CC_TAG ": activate skipped (no-network build, IPC path only)\n");
+    set_device_state(kDeviceStateIdle);
+    send_device_state();
+    send_stt("设备已经激活");
 
-    printf(CC_TAG ": running. IPC ready. Press K1 to toggle recording.\n");
+    websocket_data_t ws_data;
 
-    /* 主循环：IPC 端点在后台线程运行，这里只 sleep 等退出 */
-    while (!g_stop) {
+    // 构造 ws_data.headers
+    char ws_headers_buffer[512];
+    snprintf(ws_headers_buffer, sizeof(ws_headers_buffer),
+        "{\"Authorization\":\"Bearer test-token\",\"Protocol-Version\":\"1\",\"Device-Id\":\"%s\",\"Client-Id\":\"%s\"}",
+        mac, uuid);
+    ws_data.headers = ws_headers_buffer;
+
+    ws_data.hello = "{\"type\":\"hello\",\"version\":1,\"transport\":\"websocket\",\"audio_params\":{\"format\":\"opus\",\"sample_rate\":16000,\"channels\":1,\"frame_duration\":60}}";
+    ws_data.hostname = "api.tenclass.net";
+    ws_data.port = "443";
+    ws_data.path = "/xiaozhi/v1/";    
+
+    websocket_set_callbacks(process_opus_data_downloaded, process_txt_data_downloaded, &ws_data);
+    websocket_start();
+
+    while (1)
+    {
         sleep(1);
     }
 
-    /* 清理 */
-    ipc_endpoint_destroy_udp(g_ep_audio_up);
-    ipc_endpoint_destroy_udp(g_ep_audio_down);
-    ipc_endpoint_destroy_udp(g_ep_ui);
-    ipc_endpoint_destroy_udp(g_ep_button);
-    ipc_endpoint_destroy_udp(g_ep_ui_up);
-    if (g_dec) {
-        opus_decoder_destroy(g_dec);
-    }
-    curl_global_cleanup();
-    printf(CC_TAG ": exit\n");
+    // 清理资源
+    free(mac);
+    free(uuid);
+    
     return 0;
 }

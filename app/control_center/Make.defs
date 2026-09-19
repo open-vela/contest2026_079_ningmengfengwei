@@ -1,5 +1,5 @@
 ############################################################################
-# apps/examples/hello/Makefile
+# apps/examples/hello/Make.defs
 #
 # Licensed to the Apache Software Foundation (ASF) under one or more
 # contributor license agreements.  See the NOTICE file distributed with
@@ -18,24 +18,6 @@
 #
 ############################################################################
 
-include $(APPDIR)/Make.defs
-
-# control_center built-in application info
-
-PROGNAME  = $(CONFIG_EXAMPLES_CONTROL_CENTER_PROGNAME)
-PRIORITY  = $(CONFIG_EXAMPLES_CONTROL_CENTER_PRIORITY)
-STACKSIZE = $(CONFIG_EXAMPLES_CONTROL_CENTER_STACKSIZE)
-MODULE    = $(CONFIG_EXAMPLES_CONTROL_CENTER)
-
-# Hello, World! Example
-
-MAINSRC = control_center.c
-CSRCS =  http.c  ipc_udp.c  uuid.c  websocket_client.c leds.c
-
-CFLAGS += ${INCDIR_PREFIX}$(APPDIR)/../external/curl/curl/include/
-CFLAGS += ${INCDIR_PREFIX}$(APPDIR)/netutils/cjson/cJSON
-CFLAGS += ${INCDIR_PREFIX}$(APPDIR)/netutils/libwebsockets/libwebsockets/include
-CFLAGS += ${INCDIR_PREFIX}$(APPDIR)/netutils/libwebsockets/
-CFLAGS += ${INCDIR_PREFIX}$(APPDIR)/crypto/openssl_mbedtls_wrapper/include
-
-include $(APPDIR)/Application.mk
+ifneq ($(CONFIG_EXAMPLES_CONTROL_CENTER),)
+CONFIGURED_APPS += $(APPDIR)/examples/control_center
+endif
