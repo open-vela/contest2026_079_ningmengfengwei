@@ -1,143 +1,297 @@
-#include "ipc_udp.h"
-
+// SPDX-License-Identifier: GPL-3.0-only
+/*
+ * Copyright (c) 2008-2023 100askTeam : Dongshan WEI <weidongshan@100ask.net> 
+ * Discourse:  https://forums.100ask.net
+ */
+ 
+/*  Copyright (C) 2008-2023 深圳百问网科技有限公司
+ *  All rights reserved
+ *
+ * 免责声明: 百问网编写的文档, 仅供学员学习使用, 可以转发或引用(请保留作者信息),禁止用于商业用途！
+ * 免责声明: 百问网编写的程序, 用于商业用途请遵循GPL许可, 百问网不承担任何后果！
+ * 
+ * 本程序遵循GPL V3协议, 请遵循协议
+ * 百问网学习平台   : https://www.100ask.net
+ * 百问网交流社区   : https://forums.100ask.net
+ * 百问网官方B站    : https://space.bilibili.com/275908810
+ * 本程序所用开发板 : Linux开发板
+ * 百问网官方淘宝   : https://100ask.taobao.com
+ * 联系我们(E-mail) : weidongshan@100ask.net
+ *
+ *          版权所有，盗版必究。
+ *  
+ * 修改历史     版本号           作者        修改内容
+ *-----------------------------------------------------
+ * 2025.03.20      v01         百问科技      创建文件
+ *-----------------------------------------------------
+ */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
-#include <string.h>
-#include <stdlib.h>
-#include <unistd.h>
 #include <pthread.h>
-#include <stdio.h>
+#include <nuttx/pthread.h>
+#include <errno.h>
+#include "ipc_udp.h"
 
-#define IPC_TAG "ipc_udp"
+#include <syslog.h>
+#define printf(fmt, ...) syslog(LOG_INFO, fmt, ##__VA_ARGS__)
 
-typedef struct {
-    int sockfd;
-    int port_remote;
-    bool stop;
-    pthread_t tid;
-    bool has_thread;
-} ipc_udp_priv_t;
+// 定义UDP数据结构体
+typedef struct upd_data_t {
+    int socket_send;       // 发送数据的套接字
+    int port_remote;         // 目标端口号
+    int socket_recv;       // 接收数据的套接字
+    int port_local;          // 源端口号
+    struct sockaddr_in remote_addr;  // 目标地址结构体
+} upd_data_t, *p_upd_data_t;
 
-static int ipc_udp_send(ipc_endpoint_t *self, const char *data, int len)
+// 线程处理函数声明
+static void* handle_udp_connection(void* arg);
+
+// 发送数据的函数声明
+static int udp_send_data(ipc_endpoint_t *pendpoint, const char *data, int len);
+
+// 接收数据的函数声明
+static int udp_recv_data(ipc_endpoint_t *pendpoint, unsigned char *data, int maxlen, int *retlen);
+
+// 创建一个UDP类型的IPC端点
+p_ipc_endpoint_t ipc_endpoint_create_udp(int port_local, int port_remote, transfer_callback_t cb, void *user_data)
 {
-    ipc_udp_priv_t *p = (ipc_udp_priv_t *)self->priv;
-    if (!p || p->sockfd < 0 || p->port_remote == 0) {
-        return -1;
-    }
-    struct sockaddr_in dst;
-    memset(&dst, 0, sizeof(dst));
-    dst.sin_family = AF_INET;
-    dst.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    dst.sin_port = htons(p->port_remote);
-    return sendto(p->sockfd, data, len, 0,
-                  (struct sockaddr *)&dst, sizeof(dst));
-}
+    pthread_attr_t default_attr = { \
+        PTHREAD_DEFAULT_PRIORITY, /* priority */ \
+        PTHREAD_DEFAULT_POLICY,   /* policy */ \
+        PTHREAD_EXPLICIT_SCHED,   /* inheritsched */ \
+        PTHREAD_CREATE_JOINABLE,  /* detachstate */ \
+        0,                        /* affinity */ \
+        NULL,                     /* stackaddr */ \
+        409600,    /* stacksize */ \
+    };
 
-static int ipc_udp_recv(ipc_endpoint_t *self, unsigned char *data,
-                        int maxlen, int *retlen)
-{
-    ipc_udp_priv_t *p = (ipc_udp_priv_t *)self->priv;
-    if (!p || p->sockfd < 0) {
-        return -1;
-    }
-    struct sockaddr_in src;
-    socklen_t slen = sizeof(src);
-    int n = recvfrom(p->sockfd, data, maxlen, 0,
-                     (struct sockaddr *)&src, &slen);
-    if (retlen) {
-        *retlen = (n > 0) ? n : 0;
-    }
-    return n;
-}
+    // 分配并清零UDP数据结构体
+    p_upd_data_t pudpdata = (p_upd_data_t)calloc(1, sizeof(upd_data_t));
+    // 分配并清零IPC端点结构体
+    p_ipc_endpoint_t pendpoint = (p_ipc_endpoint_t)calloc(1, sizeof(ipc_endpoint_t));
 
-/* 后台线程：循环 recv，收到数据调 cb */
-static void *ipc_recv_thread(void *arg)
-{
-    ipc_endpoint_t *self = (ipc_endpoint_t *)arg;
-    ipc_udp_priv_t *p = (ipc_udp_priv_t *)self->priv;
-    unsigned char buf[IPC_MAX_PACKET];
+    int fd_send, fd_recv;
+    struct sockaddr_in local_addr;
+    struct sockaddr_in server_addr;
 
-    while (!p->stop) {
-        int n = recvfrom(p->sockfd, buf, sizeof(buf), 0, NULL, NULL);
-        if (n > 0 && self->cb) {
-            self->cb((const char *)buf, n, self->user_data);
+    if (!pudpdata || !pendpoint) {
+        printf("ipc_endpoint_create_udp Failed to calloc for %p, %p\n", pudpdata, pendpoint);
+        if (pendpoint) free(pendpoint);
+        if (pudpdata) free(pudpdata);
+        return NULL;            
+    }
+
+    // 关联UDP数据结构体和IPC端点结构体
+    pendpoint->priv = pudpdata;
+    pendpoint->cb = cb;
+    pendpoint->user_data = user_data;
+    pendpoint->send = udp_send_data;
+    pendpoint->recv = udp_recv_data;
+
+    // 设置远程和本地端口号
+    pudpdata->port_remote = port_remote;
+    pudpdata->port_local = port_local;
+
+    pudpdata->socket_send = -1;
+    pudpdata->socket_recv = -1;
+
+    // 1. 为了发送数据进行网络初始化
+    if (port_remote)
+    {
+        // 创建UDP套接字
+        fd_send = socket(AF_INET, SOCK_DGRAM, 0);
+        if (fd_send < 0) {
+            printf("Failed to create UDP socket for audio client");
+            free(pendpoint);
+            free(pudpdata);
+            return NULL;            
         }
-        /* n<=0 时 continue，stop 后会因 shutdown 返回 */
+
+        // 初始化服务器地址结构
+        memset(&server_addr, 0, sizeof(server_addr));
+        server_addr.sin_family = AF_INET;
+        server_addr.sin_port = htons(port_remote); // 使用传入的端口号
+        if (inet_pton(AF_INET, "127.0.0.1", &server_addr.sin_addr) <= 0) {
+            printf("Invalid address/ Address not supported");
+            close(fd_send);
+            free(pendpoint);
+            free(pudpdata);
+            return NULL;            
+        }
+
+        // 保存套接字和服务器地址信息到UDP数据结构体
+        pudpdata->socket_send = fd_send;
+        pudpdata->remote_addr = server_addr;    
     }
-    return NULL;
+    
+    // 2. 为了接收数据进行网络初始化
+    if (port_local)
+    {
+        // 创建UDP套接字
+        if ((fd_recv = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
+            printf("Failed to create fd_recv socket, %d, errno = %d, %s\n", fd_recv, errno, strerror(errno));
+            close(fd_send);
+            free(pendpoint);
+            free(pudpdata);
+            return NULL;            
+        }
+
+        pudpdata->socket_recv = fd_recv;
+
+        memset(&local_addr, 0, sizeof(local_addr));
+        local_addr.sin_family = AF_INET;
+        local_addr.sin_port = htons(port_local);
+
+        if (inet_pton(AF_INET, "127.0.0.1", &local_addr.sin_addr) <= 0) {
+            printf("Invalid address/ Address not supported");
+            close(fd_send);
+            close(fd_recv);
+            free(pendpoint);
+            free(pudpdata);
+            return NULL;            
+        }
+
+        // 绑定套接字
+        if (bind(fd_recv, (struct sockaddr *)&local_addr, sizeof(local_addr)) < 0) {
+            printf("Failed to bind socket");
+            close(fd_send);
+            close(fd_recv);
+            free(pendpoint);
+            free(pudpdata);
+            return NULL;            
+        }
+
+        // 如果有回调函数，创建线程处理UDP连接
+        if (cb) {
+            pthread_t thread_id;
+            if (pthread_create(&thread_id, &default_attr, handle_udp_connection, pendpoint) != 0) {
+                syslog(LOG_ERR, "Failed to create thread");
+                close(fd_send);
+                close(fd_recv);
+                free(pendpoint);
+                free(pudpdata);
+                return NULL;            
+            }
+        }
+    }
+
+    return pendpoint;    
 }
 
-p_ipc_endpoint_t ipc_endpoint_create_udp(int port_local, int port_remote,
-                                          transfer_callback_t cb, void *user_data)
+// 销毁IPC端点，释放相关资源
+void ipc_endpoint_destroy_udp(p_ipc_endpoint_t pendpoint)
 {
-    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (pendpoint && pendpoint->priv) {
+        p_upd_data_t pudpdata = (p_upd_data_t)pendpoint->priv;
+        if (pudpdata->socket_send >= 0) {
+            close(pudpdata->socket_send);
+        }
+        if (pudpdata->socket_recv >= 0) {
+            close(pudpdata->socket_recv);
+        }
+        free(pendpoint->priv);
+    }
+    free(pendpoint);
+}
+
+/**
+ * 处理UDP连接的线程函数
+ */
+static void* handle_udp_connection(void* arg)
+{
+    ipc_endpoint_t *pendpoint = (ipc_endpoint_t*)arg;
+    p_upd_data_t pudpdata = (p_upd_data_t)pendpoint->priv;
+
+    int fd_recv = pudpdata->socket_recv;
+    char buffer[2048];
+
+    struct sockaddr_in client_addr;
+    socklen_t client_len = sizeof(client_addr);
+    ssize_t bytes_received;
+
+    printf("Listening on port_local %d\n", pudpdata->port_local);
+
+    while (1) {
+        // 接收数据
+        bytes_received = recvfrom(fd_recv, buffer, sizeof(buffer), 0, (struct sockaddr *)&client_addr, &client_len);
+        if (bytes_received > 0) {
+            // 处理接收到的数据
+            //printf("Received %zd bytes \n", bytes_received);
+            if (pendpoint->cb) {
+                pendpoint->cb(buffer, bytes_received, pendpoint->user_data);
+            }
+        }
+    }
+
+    pthread_exit(NULL);
+}
+
+/**
+ * 发送数据到指定endpoint的通用函数
+ */
+static int udp_send_data(ipc_endpoint_t *pendpoint, const char *data, int len)
+{
+    p_upd_data_t pudpdata = (p_upd_data_t)pendpoint->priv;
+
+    // 获取套接字文件描述符
+    int fd = pudpdata->socket_send;
+    // 获取服务器地址的指针
+    struct sockaddr_in *p_server_addr = &pudpdata->remote_addr;
+
+    // 检查套接字是否已初始化
     if (fd < 0) {
-        printf(IPC_TAG ": socket failed\n");
-        return NULL;
-    }
-    int opt = 1;
-    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-
-    struct sockaddr_in local;
-    memset(&local, 0, sizeof(local));
-    local.sin_family = AF_INET;
-    local.sin_addr.s_addr = htonl(INADDR_ANY);
-    local.sin_port = htons(port_local);
-    if (bind(fd, (struct sockaddr *)&local, sizeof(local)) < 0) {
-        printf(IPC_TAG ": bind port %d failed\n", port_local);
-        close(fd);
-        return NULL;
+        fprintf(stderr, "UDP socket for audio server is not initialized\n");
+        return -1;
     }
 
-    ipc_udp_priv_t *p = calloc(1, sizeof(*p));
-    if (!p) {
-        close(fd);
-        return NULL;
+    // 发送数据到客户端
+    ssize_t bytes_sent = sendto(fd, data, len, 0, (struct sockaddr *)p_server_addr, sizeof(*p_server_addr));
+    // 检查发送的数据量是否与预期相符
+    if (bytes_sent != len) {
+        printf("Failed to send data to client");
+        return -1;
     }
-    p->sockfd = fd;
-    p->port_remote = port_remote;
-    p->stop = false;
-    p->has_thread = false;
 
-    ipc_endpoint_t *ep = calloc(1, sizeof(*ep));
-    if (!ep) {
-        free(p);
-        close(fd);
-        return NULL;
-    }
-    ep->priv = p;
-    ep->user_data = user_data;
-    ep->cb = cb;
-    ep->send = ipc_udp_send;
-    ep->recv = ipc_udp_recv;
-
-    if (cb) {
-        if (pthread_create(&p->tid, NULL, ipc_recv_thread, ep) == 0) {
-            p->has_thread = true;
-        } else {
-            printf(IPC_TAG ": recv thread create failed\n");
-        }
-    }
-    return ep;
+    // 发送成功
+    return 0;
 }
 
-void ipc_endpoint_destroy_udp(p_ipc_endpoint_t ep)
+/**
+ * 接收数据函数
+ */
+static int udp_recv_data(ipc_endpoint_t *pendpoint, unsigned char *data, int maxlen, int *retlen)
 {
-    if (!ep) {
-        return;
+    p_upd_data_t pudpdata = (p_upd_data_t)pendpoint->priv;
+
+    // 获取套接字文件描述符
+    int fd = pudpdata->socket_recv;
+
+    struct sockaddr_in client_addr;
+    socklen_t client_len = sizeof(client_addr);
+    ssize_t bytes_received;
+
+    if (fd < 0) {
+        fprintf(stderr, "UDP socket for audio client is not initialized\n");
+        return -1;
     }
-    ipc_udp_priv_t *p = (ipc_udp_priv_t *)ep->priv;
-    if (p) {
-        p->stop = true;
-        if (p->sockfd >= 0) {
-            shutdown(p->sockfd, 0);
-            close(p->sockfd);
-        }
-        if (p->has_thread) {
-            pthread_join(p->tid, NULL);
-        }
-        free(p);
+
+    // 接收数据
+    bytes_received = recvfrom(fd, data, maxlen, 0, (struct sockaddr *)&client_addr, &client_len);
+    if (bytes_received < 0) {
+        printf("Failed to receive data from server");
+        return -1;
     }
-    free(ep);
+
+    *retlen = (int)bytes_received;
+
+    return 0;
 }

@@ -8,14 +8,15 @@
 #define XIAOZHI_WS_HOST       "api.xiaozhi.me"
 #define XIAOZHI_WS_PATH       "/v1/chat/completions"
 #define XIAOZHI_WS_PORT       443
-#define XIAOZHI_ACTIVATE_URL  "https://api.xiaozhi.me/v1/device/activate"
+#define XIAOZHI_ACTIVATE_URL  "https://120.77.35.162/v1/device/activate"
+#define XIAOZHI_ACTIVATE_HOST "Host: api.xiaozhi.me"
 #define XIAOZHI_PROTO_VER     3
 
-/* opus 参数（对齐小智 hello audio_params）*/
-#define OPUS_SAMPLE_RATE      16000
-#define OPUS_CHANNELS         1
+/* opus 参数（对齐 DMIC 硬件48kHz/2ch + 小智 BinaryProtocol3 60ms帧）*/
+#define OPUS_SAMPLE_RATE      48000
+#define OPUS_CHANNELS         2
 #define OPUS_FRAME_MS         60
-#define OPUS_FRAME_SIZE       (OPUS_SAMPLE_RATE / 1000 * OPUS_FRAME_MS)  /* 960 samples */
+#define OPUS_FRAME_SIZE       (OPUS_SAMPLE_RATE / 1000 * OPUS_FRAME_MS)  /* 2880 samples */
 
 /* 二进制音频帧 type（小智 BinaryProtocol3）*/
 #define XZ_BIN_TYPE_OPUS      0

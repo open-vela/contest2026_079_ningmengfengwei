@@ -12,5 +12,9 @@
     <linkfile src="app/hello_app" dest="packages/demos/contest2026_079_hello_app"/>
     <linkfile src="quickapp/hello_quickapp" dest="packages/apps/contest2026_079_hello_quickapp"/>
     <linkfile src="board/contest_board" dest="vendor/openvela/boards/contest2026_079_board"/>
+    <!-- VelaAI 桌面语音助手作品 -->
+    <linkfile src="app/control_center" dest="apps/examples/control_center"/>
+    <linkfile src="app/button_led" dest="apps/examples/button_led"/>
+    <linkfile src="app/lvgldemo" dest="apps/examples/lvgldemo"/>
   </project>
 </manifest>
